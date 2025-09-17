@@ -1121,3 +1121,112 @@ class Classify(nn.Module):
         if isinstance(x, list):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+
+# ---------- PP-LCNet backbone & helpers ----------
+import math
+import torch
+import torch.nn as nn
+
+def _make_divisible(v, divisor=8, min_value=None):
+    if min_value is None:
+        min_value = divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    if new_v < 0.9 * v:
+        new_v += divisor
+    return new_v
+
+class DWConvBNAct(nn.Module):
+    """Depthwise 3x3 -> BN -> Act, then Pointwise 1x1 -> BN -> Act"""
+    def __init__(self, in_ch, out_ch, stride=1, act='hswish'):
+        super().__init__()
+        if act == 'hswish':
+            act_layer = nn.Hardswish
+        elif act == 'silu':
+            act_layer = nn.SiLU
+        else:
+            act_layer = nn.ReLU
+        self.dw = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, 3, stride=stride, padding=1, groups=in_ch, bias=False),
+            nn.BatchNorm2d(in_ch),
+            act_layer(inplace=True),
+        )
+        self.pw = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(out_ch),
+            act_layer(inplace=True),
+        )
+
+    def forward(self, x):
+        x = self.dw(x)
+        x = self.pw(x)
+        return x
+
+class PP_LCNet(nn.Module):
+    """
+    PP-LCNet (简化版)：
+    - stem: 3x3 s2
+    - 若干 DWConvBNAct 堆叠，部分阶段降采样
+    - 返回 (C3, C4, C5) 三个尺度（约等于 stride 8/16/32）
+    参数:
+      width_mult: 宽度倍率 (默认 1.0)
+      out_indices: 返回的阶段索引，固定 (3, 4, 5) -> C3/C4/C5
+      act: 'hswish' | 'silu' | 'relu'
+    """
+    def __init__(self, width_mult=1.0, out_indices=(3, 4, 5), act='hswish'):
+        super().__init__()
+        self.out_indices = out_indices
+        Act = nn.Hardswish if act == 'hswish' else (nn.SiLU if act == 'silu' else nn.ReLU)
+
+        # —— 通道配置（1.0x），参考移动端轻量级网络的典型配比，方便与 PAN/FPN 对接 ——
+        # (out_ch, num_blocks, stride)；当 stride=2 时做下采样
+        stage_cfg = [
+            (16, 1, 2),   # stage0: 1/2
+            (32, 1, 2),   # stage1: 1/4
+            (64, 2, 2),   # stage2: 1/8  -> C3
+            (160, 3, 2),  # stage3: 1/16 -> C4
+            (320, 2, 2),  # stage4: 1/32 -> C5
+        ]
+
+        in_ch = _make_divisible(16 * width_mult)
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, in_ch, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(in_ch),
+            Act(inplace=True),
+        )
+
+        stages = []
+        cur_stride = 2  # after stem
+
+        for out_ch, n, s in stage_cfg:
+            out_ch = _make_divisible(out_ch * width_mult)
+            blocks = []
+            # 第一层可以带 stride（如果需要下采样）
+            blocks.append(DWConvBNAct(in_ch, out_ch, stride=s, act='hswish'))
+            for _ in range(n - 1):
+                blocks.append(DWConvBNAct(out_ch, out_ch, stride=1, act='hswish'))
+            stages.append(nn.Sequential(*blocks))
+            in_ch = out_ch
+            cur_stride *= s if s in (1, 2) else 1
+
+        self.stages = nn.ModuleList(stages)
+        self.return_ids = out_indices  # 与 stage 索引一致：2->C3, 3->C4, 4->C5
+
+    def forward(self, x):
+        feats = []
+        x = self.stem(x)  # stride 2
+        for i, stage in enumerate(self.stages):
+            x = stage(x)
+            feats.append(x)
+        # feats 索引: 0..4；我们期望返回 (stage2, stage3, stage4) -> (C3, C4, C5)
+        outs = [feats[i] for i in self.return_ids]
+        return outs  # 列表 [C3, C4, C5]
+
+class IndexSelect(nn.Module):
+    """从输入的 list[Tensor] 中取第 i 个 Tensor"""
+    def __init__(self, i=0):
+        super().__init__()
+        self.i = int(i)
+    def forward(self, x):
+        # 允许上游是 list 或 tuple
+        assert isinstance(x, (list, tuple)), "IndexSelect expects a list/tuple input"
+        return x[self.i]
