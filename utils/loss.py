@@ -6,6 +6,14 @@ import torch.nn as nn
 
 from utils.metrics import bbox_iou
 from utils.torch_utils import de_parallel
+# 原来：
+from utils.metrics import bbox_iou  # 保留官方的
+from utils.wiou import IouLoss      # 只引入 IoULoss，不再从 wiou 里引 bbox_iou
+from utils.general import xywh2xyxy
+
+
+
+
 
 
 def smooth_BCE(eps=0.1):
@@ -135,6 +143,10 @@ class ComputeLoss:
         self.nl = m.nl  # number of layers
         self.anchors = m.anchors
         self.device = device
+        #self.wiou = IoULoss(ltype='WIoU', loss=True, monotonous=False)  # WIoU（v3 风格，非单调聚焦）
+        self.wiou = IouLoss(ltype='WIoU', monotonous=False)
+        self.wiou.to(self.device)  # 或者：self.wiou.to(next(model.parameters()).device)
+        self.wiou.train()
 
     def __call__(self, p, targets):  # predictions, targets
         """Performs forward pass, calculating class, box, and object loss for given predictions and targets."""
@@ -156,17 +168,42 @@ class ComputeLoss:
                 pxy = pxy.sigmoid() * 2 - 0.5
                 pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
-                iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                #iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
+                #lbox += (1.0 - iou).mean()  # iou loss
+                #-------------------------添加代码
+                # ---- 用 WIoU 计算框回归损失 lbox ----
+                # pbox/tbox 当前是 xywh，需要先转 xyxy 给 WIoU
+                p_xyxy = xywh2xyxy(torch.cat((pxy, pwh), 1))
+                t_xyxy = xywh2xyxy(tbox[i].clone())
+                t_xywh = tbox[i]  # [n,4] target in xywh
+                lbox += self.wiou(p_xyxy, t_xyxy).mean()  # WIoU 已是损失，不要再 (1 - ·)
 
-                # Objectness
-                iou = iou.detach().clamp(0).type(tobj.dtype)
-                if self.sort_obj_iou:
-                    j = iou.argsort()
-                    b, a, gj, gi, iou = b[j], a[j], gj[j], gi[j], iou[j]
+                # ---- objectness 仍用 IoU（非 CIoU/WIoU），只作为置信度的比例因子 ----
+                # 注意：这里用的是原始的 bbox_iou（metrics.py），且 CIoU=False
+                iou_obj = bbox_iou(pbox, t_xywh, CIoU=False).squeeze()  # IoU \in [0,1]
+
                 if self.gr < 1:
-                    iou = (1.0 - self.gr) + self.gr * iou
-                tobj[b, a, gj, gi] = iou  # iou ratio
+                    iou_obj = (1.0 - self.gr) + self.gr * iou_obj  # IoU ratio（与原版一致）
+
+                # 只把“用于 objectness 的 IoU 比例”写回 tobj，且要 detach/clamp/cast
+                iou_for_obj = iou_obj.detach().clamp(0, 1).to(tobj.dtype)
+
+
+                if self.sort_obj_iou:
+                    j = iou_for_obj.argsort()
+                    b, a, gj, gi, iou_for_obj = b[j], a[j], gj[j], gi[j], iou_for_obj[j]
+
+                tobj[b, a, gj, gi] = iou_for_obj  # 仅 objectness 用到的 IoU
+
+                # -------------------------------------------------------------------
+                # Objectness
+                '''iou = iou.detach().clamp(0).type(tobj.dtype)
+                    if self.sort_obj_iou:
+                        j = iou.argsort()
+                        b, a, gj, gi, iou = b[j], a[j], gj[j], gi[j], iou[j]
+                    if self.gr < 1:
+                        iou = (1.0 - self.gr) + self.gr * iou
+                    tobj[b, a, gj, gi] = iou''' # iou ratio
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
