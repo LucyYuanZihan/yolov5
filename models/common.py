@@ -1163,28 +1163,23 @@ class DWConvBNAct(nn.Module):
 
 class PP_LCNet(nn.Module):
     """
-    PP-LCNet (简化版)：
-    - stem: 3x3 s2
-    - 若干 DWConvBNAct 堆叠，部分阶段降采样
-    - 返回 (C3, C4, C5) 三个尺度（约等于 stride 8/16/32）
+    ...
     参数:
-      width_mult: 宽度倍率 (默认 1.0)
-      out_indices: 返回的阶段索引，固定 (3, 4, 5) -> C3/C4/C5
+      width_mult: ...
+      out_indices: 返回的阶段索引，固定 (2, 3, 4) -> C3/C4/C5   # ← 注释也改
       act: 'hswish' | 'silu' | 'relu'
     """
-    def __init__(self, width_mult=1.0, out_indices=(3, 4, 5), act='hswish'):
+    def __init__(self, width_mult=1.0, out_indices=(2, 3, 4), act='hswish'):  # ← 默认值改这里
         super().__init__()
         self.out_indices = out_indices
         Act = nn.Hardswish if act == 'hswish' else (nn.SiLU if act == 'silu' else nn.ReLU)
 
-        # —— 通道配置（1.0x），参考移动端轻量级网络的典型配比，方便与 PAN/FPN 对接 ——
-        # (out_ch, num_blocks, stride)；当 stride=2 时做下采样
         stage_cfg = [
-            (16, 1, 2),   # stage0: 1/2
-            (32, 1, 2),   # stage1: 1/4
-            (64, 2, 2),   # stage2: 1/8  -> C3
-            (160, 3, 2),  # stage3: 1/16 -> C4
-            (320, 2, 2),  # stage4: 1/32 -> C5
+            (16, 1, 2),
+            (32, 1, 2),
+            (64, 2, 1),   # stage2 -> stride 8 (C3)
+            (160, 3, 2),  # stage3 -> stride 16 (C4)
+            (320, 2, 2),  # stage4 -> stride 32 (C5)
         ]
 
         in_ch = _make_divisible(16 * width_mult)
@@ -1195,38 +1190,47 @@ class PP_LCNet(nn.Module):
         )
 
         stages = []
-        cur_stride = 2  # after stem
-
+        stage_out_chs = []  # 记录每个stage的输出通道
         for out_ch, n, s in stage_cfg:
             out_ch = _make_divisible(out_ch * width_mult)
-            blocks = []
-            # 第一层可以带 stride（如果需要下采样）
-            blocks.append(DWConvBNAct(in_ch, out_ch, stride=s, act='hswish'))
+            blocks = [DWConvBNAct(in_ch, out_ch, stride=s, act=act)]
             for _ in range(n - 1):
-                blocks.append(DWConvBNAct(out_ch, out_ch, stride=1, act='hswish'))
+                blocks.append(DWConvBNAct(out_ch, out_ch, stride=1, act=act))
             stages.append(nn.Sequential(*blocks))
+            stage_out_chs.append(out_ch)  # 记录
             in_ch = out_ch
-            cur_stride *= s if s in (1, 2) else 1
 
         self.stages = nn.ModuleList(stages)
-        self.return_ids = out_indices  # 与 stage 索引一致：2->C3, 3->C4, 4->C5
+        self.return_ids = tuple(int(i) for i in out_indices)
+        n_stages = len(self.stages)
+        if any(i < 0 or i >= n_stages for i in self.return_ids):
+            raise ValueError(f"PP_LCNet out_indices {self.return_ids} out of range 0..{n_stages - 1}")
 
-    def forward(self, x):
+        # 动态得到 C3/C4/C5 通道
+        self.out_channels = [stage_out_chs[i] for i in self.return_ids]
+
+    def forward(self, x):   # ← 一定要在类里（缩进到 class 内）
         feats = []
-        x = self.stem(x)  # stride 2
-        for i, stage in enumerate(self.stages):
+        x = self.stem(x)
+        for stage in self.stages:
             x = stage(x)
             feats.append(x)
-        # feats 索引: 0..4；我们期望返回 (stage2, stage3, stage4) -> (C3, C4, C5)
         outs = [feats[i] for i in self.return_ids]
-        return outs  # 列表 [C3, C4, C5]
+        print([t.shape for t in outs])  # 期待 [N,64, H/8, W/8], [N,160, H/16, W/16], [N,320, H/32, W/32]
+        assert len(outs) == 3, f"PP_LCNet expected 3 outputs, got {len(outs)}; out_indices={self.return_ids}"
+        return outs
+
 
 class IndexSelect(nn.Module):
     """从输入的 list[Tensor] 中取第 i 个 Tensor"""
     def __init__(self, i=0):
         super().__init__()
-        self.i = int(i)
+        self.idx = int(i)  # ← 换成 idx，避免与 YOLOv5 的 m_.i 冲突
     def forward(self, x):
-        # 允许上游是 list 或 tuple
-        assert isinstance(x, (list, tuple)), "IndexSelect expects a list/tuple input"
-        return x[self.i]
+        if not isinstance(x, (list, tuple)):
+            raise TypeError(f"IndexSelect expects list/tuple, got {type(x)}")
+        if self.idx >= len(x):
+            raise IndexError(f"IndexSelect idx={self.idx}, but got list of len={len(x)}")
+        return x[self.idx]
+
+

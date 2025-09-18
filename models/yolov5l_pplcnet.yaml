@@ -1,44 +1,41 @@
-# YOLOv5-L head with PP-LCNet backbone (3-out) —— Lucy 专用
-# 注：根据你的数据集修改 nc；anchors 可沿用默认
+# YOLOv5-L with PP-LCNet backbone (3-out)
 
-nc: 1  # 改成你的类别数
+nc: 1
 depth_multiple: 1.0
 width_multiple: 1.0
 
 anchors:
-  - [10,13, 16,30, 33,23]
-  - [30,61, 62,45, 59,119]
-  - [116,90, 156,198, 373,326]
+  - [10, 13, 16, 30, 33, 23]
+  - [30, 61, 62, 45, 59, 119]
+  - [116, 90, 156, 198, 373, 326]
 
-# PP_LCNet 返回三层 (C3,C4,C5) 通道 ~ [64,160,320]（width_mult=1.0）
-# 用 IndexSelect 把列表输出拆出来，供后续 PAN/FPN 使用
+# PP_LCNet 输出三层 (C3,C4,C5) ≈ [64,160,320] @ strides 8/16/32
 
-backbone:
-  # from, number, module, args
-  - [-1, 1, PP_LCNet, [1.0]]     # 0: outputs [C3, C4, C5] list
-  - [ 0, 1, IndexSelect, [0]]    # 1: P3_in (C3, ~64ch, stride 8)
-  - [ 0, 1, IndexSelect, [1]]    # 2: P4_in (C4, ~160ch, stride 16)
-  - [ 0, 1, IndexSelect, [2]]    # 3: P5_in (C5, ~320ch, stride 32)
+backbone: [
+  [-1, 1, PP_LCNet, [1.0, [2, 3, 4]]],  # 0: 输出 list=[C3,C4,C5]
+  [ 0, 1, IndexSelect, [0]],             # 1: C3 (s=8)
+  [ 0, 1, IndexSelect, [1]],             # 2: C4 (s=16)
+  [ 0, 1, IndexSelect, [2]],             # 3: C5 (s=32)
+]
 
-neck:
-  # 自顶向下
-  - [ 3, 1, SPPF, [256, 5]]              # 4: SPPF 将 C5 -> 256
-  - [ 4, 1, Upsample, [None, 2, 'nearest']] # 5
-  - [[5, 2], 1, Concat, [1]]             # 6: [P5_up, P4_in], ch=256+~160
-  - [ 6, 3, C3, [256, False]]            # 7: 融合后统一到 256
+head: [
+  [ 3, 1, SPPF, [256, 5]],                     # 4: 320->256
+  [ 4, 1, nn.Upsample, [None, 2, 'nearest']],  # 5
+  [[5, 2], 1, Concat, [1]],                    # 6
+  [ 6, 3, C3, [256, False]],                   # 7
 
-  - [ 7, 1, Upsample, [None, 2, 'nearest']] # 8
-  - [[8, 1], 1, Concat, [1]]             # 9: [P4_up, P3_in], ch=256+~64
-  - [ 9, 3, C3, [128, False]]            # 10: 最小尺度特征，调到 128
+  [ 7, 1, nn.Upsample, [None, 2, 'nearest']],  # 8
+  [[8, 1], 1, Concat, [1]],                    # 9
+  [ 9, 3, C3, [128, False]],                   # 10 (P3)
 
-  # 自底向上
-  - [10, 1, Conv, [256, 3, 2]]           # 11: down 到 stride 16
-  - [[11, 7], 1, Concat, [1]]            # 12
-  - [12, 3, C3, [256, False]]            # 13
+  [10, 1, Conv, [256, 3, 2]],                  # 11  ✅
+  [[11, 7], 1, Concat, [1]],                   # 12
+  [12, 3, C3, [256, False]],                   # 13 (P4)
 
-  - [13, 1, Conv, [256, 3, 2]]           # 14: down 到 stride 32
-  - [[14, 4], 1, Concat, [1]]            # 15
-  - [15, 3, C3, [256, False]]            # 16
+  [13, 1, Conv, [256, 3, 2]],                  # 14  ✅
+  [[14, 4], 1, Concat, [1]],                   # 15
+  [15, 3, C3, [256, False]],                   # 16 (P5)
 
-head:
-  - [[10, 13, 16], 1, Detect, [nc]]      # 17: P3/P4/P5 heads
+  [[10, 13, 16], 1, Detect, [nc, anchors]],    # 17
+]
+
