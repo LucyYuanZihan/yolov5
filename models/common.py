@@ -1136,8 +1136,8 @@ def _make_divisible(v, divisor=8, min_value=None):
     return new_v
 
 class DWConvBNAct(nn.Module):
-    """Depthwise 3x3 -> BN -> Act, then Pointwise 1x1 -> BN -> Act"""
-    def __init__(self, in_ch, out_ch, stride=1, act='hswish'):
+    """Depthwise kxk -> BN -> Act, then Pointwise 1x1 -> BN -> Act"""
+    def __init__(self, in_ch, out_ch, stride=1, act='hswish', k=3):
         super().__init__()
         if act == 'hswish':
             act_layer = nn.Hardswish
@@ -1145,8 +1145,9 @@ class DWConvBNAct(nn.Module):
             act_layer = nn.SiLU
         else:
             act_layer = nn.ReLU
+        p = k // 2
         self.dw = nn.Sequential(
-            nn.Conv2d(in_ch, in_ch, 3, stride=stride, padding=1, groups=in_ch, bias=False),
+            nn.Conv2d(in_ch, in_ch, k, stride=stride, padding=p, groups=in_ch, bias=False),
             nn.BatchNorm2d(in_ch),
             act_layer(inplace=True),
         )
@@ -1161,6 +1162,7 @@ class DWConvBNAct(nn.Module):
         x = self.pw(x)
         return x
 
+
 class PP_LCNet(nn.Module):
     """
     ...
@@ -1169,55 +1171,47 @@ class PP_LCNet(nn.Module):
       out_indices: 返回的阶段索引，固定 (2, 3, 4) -> C3/C4/C5   # ← 注释也改
       act: 'hswish' | 'silu' | 'relu'
     """
-    def __init__(self, width_mult=1.0, out_indices=(2, 3, 4), act='hswish'):  # ← 默认值改这里
+
+    def __init__(self, width_mult=1.0, out_indices=(1, 2, 3), act='hswish'):
         super().__init__()
-        self.out_indices = out_indices
         Act = nn.Hardswish if act == 'hswish' else (nn.SiLU if act == 'silu' else nn.ReLU)
+        _md = _make_divisible  # 文件里已有
 
-        stage_cfg = [
-            (16, 1, 2),
-            (32, 1, 2),
-            (64, 2, 1),   # stage2 -> stride 8 (C3)
-            (160, 3, 2),  # stage3 -> stride 16 (C4)
-            (320, 2, 2),  # stage4 -> stride 32 (C5)
-        ]
+        # 通道设定（与图一致）
+        c_stem = _md(16 * width_mult)
+        c1 = _md(32 * width_mult)
+        c2 = _md(64 * width_mult)  # -> P3
+        c3 = _md(160 * width_mult)  # -> P4
+        c4 = _md(320 * width_mult)  # -> P5
 
-        in_ch = _make_divisible(16 * width_mult)
+        # Stem
         self.stem = nn.Sequential(
-            nn.Conv2d(3, in_ch, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(in_ch),
+            nn.Conv2d(3, c_stem, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(c_stem),
             Act(inplace=True),
         )
 
-        stages = []
-        stage_out_chs = []  # 记录每个stage的输出通道
-        for out_ch, n, s in stage_cfg:
-            out_ch = _make_divisible(out_ch * width_mult)
-            blocks = [DWConvBNAct(in_ch, out_ch, stride=s, act=act)]
-            for _ in range(n - 1):
-                blocks.append(DWConvBNAct(out_ch, out_ch, stride=1, act=act))
-            stages.append(nn.Sequential(*blocks))
-            stage_out_chs.append(out_ch)  # 记录
-            in_ch = out_ch
+        # 四个 stage，严格对应你的图；每个 stage 只有 1 个 DSConv
+        self.stage1 = DWConvBNAct(c_stem, c1, stride=2, act=act, k=3)  # -> stride 4
+        self.stage2 = DWConvBNAct(c1, c2, stride=2, act=act, k=3)  # -> stride 8  (P3)
+        self.stage3 = DWConvBNAct(c2, c3, stride=2, act=act, k=3)  # -> stride 16 (P4)
+        self.stage4 = DWConvBNAct(c3, c4, stride=2, act=act, k=5)  # -> stride 32 (P5)
 
-        self.stages = nn.ModuleList(stages)
+        self.stages = nn.ModuleList([self.stage1, self.stage2, self.stage3, self.stage4])
+
+        # 返回哪个 stage 的输出（默认取 P3/P4/P5）
         self.return_ids = tuple(int(i) for i in out_indices)
-        n_stages = len(self.stages)
-        if any(i < 0 or i >= n_stages for i in self.return_ids):
-            raise ValueError(f"PP_LCNet out_indices {self.return_ids} out of range 0..{n_stages - 1}")
+        assert all(0 <= i < 4 for i in self.return_ids)
+        chs = [c1, c2, c3, c4]
+        self.out_channels = [chs[i] for i in self.return_ids]
 
-        # 动态得到 C3/C4/C5 通道
-        self.out_channels = [stage_out_chs[i] for i in self.return_ids]
-
-    def forward(self, x):   # ← 一定要在类里（缩进到 class 内）
-        feats = []
+    def forward(self, x):
         x = self.stem(x)
-        for stage in self.stages:
-            x = stage(x)
+        feats = []
+        for m in self.stages:
+            x = m(x)
             feats.append(x)
-        outs = [feats[i] for i in self.return_ids]
-        #print([t.shape for t in outs])  # 期待 [N,64, H/8, W/8], [N,160, H/16, W/16], [N,320, H/32, W/32]
-        assert len(outs) == 3, f"PP_LCNet expected 3 outputs, got {len(outs)}; out_indices={self.return_ids}"
+        outs = [feats[i] for i in self.return_ids]  # (P3,P4,P5)
         return outs
 
 
