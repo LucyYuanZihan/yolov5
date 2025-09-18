@@ -1216,7 +1216,7 @@ class PP_LCNet(nn.Module):
             x = stage(x)
             feats.append(x)
         outs = [feats[i] for i in self.return_ids]
-        print([t.shape for t in outs])  # 期待 [N,64, H/8, W/8], [N,160, H/16, W/16], [N,320, H/32, W/32]
+        #print([t.shape for t in outs])  # 期待 [N,64, H/8, W/8], [N,160, H/16, W/16], [N,320, H/32, W/32]
         assert len(outs) == 3, f"PP_LCNet expected 3 outputs, got {len(outs)}; out_indices={self.return_ids}"
         return outs
 
