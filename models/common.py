@@ -1121,3 +1121,116 @@ class Classify(nn.Module):
         if isinstance(x, list):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+
+# ---------- PP-LCNet backbone & helpers ----------
+import math
+import torch
+import torch.nn as nn
+
+def _make_divisible(v, divisor=8, min_value=None):
+    if min_value is None:
+        min_value = divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    if new_v < 0.9 * v:
+        new_v += divisor
+    return new_v
+
+class DWConvBNAct(nn.Module):
+    """Depthwise 3x3 -> BN -> Act, then Pointwise 1x1 -> BN -> Act"""
+    def __init__(self, in_ch, out_ch, stride=1, act='hswish'):
+        super().__init__()
+        if act == 'hswish':
+            act_layer = nn.Hardswish
+        elif act == 'silu':
+            act_layer = nn.SiLU
+        else:
+            act_layer = nn.ReLU
+        self.dw = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, 3, stride=stride, padding=1, groups=in_ch, bias=False),
+            nn.BatchNorm2d(in_ch),
+            act_layer(inplace=True),
+        )
+        self.pw = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(out_ch),
+            act_layer(inplace=True),
+        )
+
+    def forward(self, x):
+        x = self.dw(x)
+        x = self.pw(x)
+        return x
+
+class PP_LCNet(nn.Module):
+    """
+    ...
+    参数:
+      width_mult: ...
+      out_indices: 返回的阶段索引，固定 (2, 3, 4) -> C3/C4/C5   # ← 注释也改
+      act: 'hswish' | 'silu' | 'relu'
+    """
+    def __init__(self, width_mult=1.0, out_indices=(2, 3, 4), act='hswish'):  # ← 默认值改这里
+        super().__init__()
+        self.out_indices = out_indices
+        Act = nn.Hardswish if act == 'hswish' else (nn.SiLU if act == 'silu' else nn.ReLU)
+
+        stage_cfg = [
+            (16, 1, 2),
+            (32, 1, 2),
+            (64, 2, 1),   # stage2 -> stride 8 (C3)
+            (160, 3, 2),  # stage3 -> stride 16 (C4)
+            (320, 2, 2),  # stage4 -> stride 32 (C5)
+        ]
+
+        in_ch = _make_divisible(16 * width_mult)
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, in_ch, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(in_ch),
+            Act(inplace=True),
+        )
+
+        stages = []
+        stage_out_chs = []  # 记录每个stage的输出通道
+        for out_ch, n, s in stage_cfg:
+            out_ch = _make_divisible(out_ch * width_mult)
+            blocks = [DWConvBNAct(in_ch, out_ch, stride=s, act=act)]
+            for _ in range(n - 1):
+                blocks.append(DWConvBNAct(out_ch, out_ch, stride=1, act=act))
+            stages.append(nn.Sequential(*blocks))
+            stage_out_chs.append(out_ch)  # 记录
+            in_ch = out_ch
+
+        self.stages = nn.ModuleList(stages)
+        self.return_ids = tuple(int(i) for i in out_indices)
+        n_stages = len(self.stages)
+        if any(i < 0 or i >= n_stages for i in self.return_ids):
+            raise ValueError(f"PP_LCNet out_indices {self.return_ids} out of range 0..{n_stages - 1}")
+
+        # 动态得到 C3/C4/C5 通道
+        self.out_channels = [stage_out_chs[i] for i in self.return_ids]
+
+    def forward(self, x):   # ← 一定要在类里（缩进到 class 内）
+        feats = []
+        x = self.stem(x)
+        for stage in self.stages:
+            x = stage(x)
+            feats.append(x)
+        outs = [feats[i] for i in self.return_ids]
+        print([t.shape for t in outs])  # 期待 [N,64, H/8, W/8], [N,160, H/16, W/16], [N,320, H/32, W/32]
+        assert len(outs) == 3, f"PP_LCNet expected 3 outputs, got {len(outs)}; out_indices={self.return_ids}"
+        return outs
+
+
+class IndexSelect(nn.Module):
+    """从输入的 list[Tensor] 中取第 i 个 Tensor"""
+    def __init__(self, i=0):
+        super().__init__()
+        self.idx = int(i)  # ← 换成 idx，避免与 YOLOv5 的 m_.i 冲突
+    def forward(self, x):
+        if not isinstance(x, (list, tuple)):
+            raise TypeError(f"IndexSelect expects list/tuple, got {type(x)}")
+        if self.idx >= len(x):
+            raise IndexError(f"IndexSelect idx={self.idx}, but got list of len={len(x)}")
+        return x[self.idx]
+
+

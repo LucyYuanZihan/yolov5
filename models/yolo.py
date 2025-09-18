@@ -17,6 +17,9 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from utils.general import check_yaml, yaml_load, LOGGER
+
+
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
@@ -48,6 +51,8 @@ from models.common import (
     GhostBottleneck,
     GhostConv,
     Proto,
+    PP_LCNet,
+    IndexSelect
 )
 from models.experimental import MixConv2d
 from utils.autoanchor import check_anchor_order
@@ -434,6 +439,14 @@ def parse_model(d, ch):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         # TODO: channel, gw, gd
+        # ★ 新增：IndexSelect 的通道数来自它“from”的 PP_LCNet 的 out_channels
+        elif m is IndexSelect:
+            # f 通常是 0（来自第 0 层 PP_LCNet），args[0] 是要取的第几个输出(0/1/2)
+            src = f if isinstance(f, int) else f[0]
+            idx = int(args[0])
+            src_m = layers[src]  # 第 0 层的 PP_LCNet 实例
+            if hasattr(src_m, "out_channels"):
+                c2 = src_m.out_channels[idx]
         elif m in {Detect, Segment}:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
